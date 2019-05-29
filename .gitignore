@@ -1,0 +1,7 @@
+.*.swp
+.depend*
+TAGS
+gitbrutec
+gitbrutec.debug
+gitbrutec.full
+gitbrutec.o
