@@ -79,6 +79,7 @@ static unsigned nthreads __read_mostly;
 
 static const char *the_object __read_mostly;
 static size_t the_obj_size __read_mostly;
+static unsigned max_commit_behind __read_mostly;
 
 static time_t start __read_mostly;
 
@@ -314,8 +315,10 @@ explore_emit(struct try tt)
 
 	/* Yield and spin trying to produce a result, unless dying. */
 	while (!ck_ring_enqueue_spmc_size(&possibilities, poss_buf, t, &len)) {
+#if 0
 		if (verboseflag)
 			printf("%s: q full\n", __func__);
+#endif
 
 		thrd_yield();
 		if ((++k % 32) == 0 &&
@@ -329,11 +332,15 @@ explore(void *dummy __unused)
 {
 	size_t max, i, j;
 
-	for (max = 0;; max++) {
+	for (max = 0; max <= max_commit_behind; max++) {
 		for (i = 0; i < max; i++)
 			explore_emit((struct try){ i, max });
 		for (j = 0; j <= max; j++)
 			explore_emit((struct try){ max, j });
+	}
+	for (;; max++) {
+		for (i = 0; i <= max_commit_behind; i++)
+			explore_emit((struct try){ i, max });
 	}
 	/* UNREACHABLE */
 	abort();
@@ -391,6 +398,23 @@ next_line:
 
 	errx(EX_SOFTWARE, "%s: failed to find '%s' after %zu lines:\n%s",
 	    __func__, needle, lines, haystack);
+}
+
+static void
+setMaxCommitBehind(char *pobj)
+{
+	time_t pcommit, ocommit;
+	size_t dummy1, dummy2;
+
+	getDate(pobj, "committer ", &pcommit, &dummy1, &dummy2);
+	getDate(the_object, "committer ", &ocommit, &dummy1, &dummy2);
+
+	if (ocommit > pcommit) {
+		max_commit_behind = (ocommit - pcommit - 1);
+		if (verboseflag)
+			printf("Max commit-behind: %u\n", max_commit_behind);
+	} else
+		max_commit_behind = UINT_MAX;
 }
 
 /*
@@ -730,6 +754,9 @@ main(int argc, char **argv)
 	obj = catfile_p_hash(hash);
 	the_obj_size = strlen(obj);
 	the_object = obj;
+
+	obj = catfile_p_hash("HEAD^");
+	setMaxCommitBehind(obj);
 
 	threads = calloc(nthreads, sizeof(*threads));
 	assert(threads != NULL);
