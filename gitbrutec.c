@@ -54,15 +54,26 @@
 
 #include <openssl/sha.h>
 
+/* XXX: Missing ldscript: '*(SORT_BY_ALIGNMENT(.data.read_frequently))'. */
+#ifndef __read_frequently
+#define	__read_frequently	__section(".data.read_frequently")
+#endif
 #ifndef __read_mostly
 #define	__read_mostly		__section(".data.read_mostly")
 #endif
 
 static const char *progname;
 
+#define	MAX_PREFIX_LEN	10	/* Optimize cache use for realistic match sizes.  Max max: 20 (SHA1). */
+#define	MAX_HEX_PRELEN	(MAX_PREFIX_LEN * 2)
+
 static bool forceflag __read_mostly;
 static bool verboseflag __read_mostly;
-static char chosen_prefix[40] __read_mostly, cprefix_bin[20] __read_mostly;
+static bool nomask __read_frequently = true;
+static char chosen_prefix[MAX_HEX_PRELEN],
+	    chosen_mask[MAX_HEX_PRELEN],
+	    cprefix_bin[MAX_PREFIX_LEN] __read_frequently,
+	    cmask_bin[MAX_PREFIX_LEN] __read_frequently;
 static size_t prefix_len_nibbles __read_mostly;
 static unsigned nthreads __read_mostly;
 
@@ -87,7 +98,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-"usage: %s [-fv] [-t THREADS] PREFIX\n"
+"usage: %s [-fv] [-t THREADS] PREFIX [MASK]\n"
 "\n"
 "        -f : Force.  Re-run, even if current hash matches prefix.\n"
 "        -t THREADS : Specify the number of threads to use.  The tool\n"
@@ -96,6 +107,8 @@ usage(void)
 "        -v : Verbose.\n"
 "        PREFIX : Specify the target prefix in hexadecimal.  (This tool\n"
 "             is limited to prefixes of bitlengths that are multiples of 4.)\n"
+"        MASK : Specify the target mask in hex.  If absent, assumes every\n"
+"             prefix bit is significant, i.e., ffff...ffff.\n"
 "\n", progname);
 	exit(EX_USAGE);
 }
@@ -385,17 +398,67 @@ next_line:
  * matches that of 'computed'.
  */
 static bool
-prefix_match(uint8_t *chosen, uint8_t *computed, size_t nibbles)
+prefix_match(const uint8_t * __restrict computed)
 {
-	if (__predict_true(nibbles > 1) &&
-	    memcmp(chosen, computed, nibbles / 2) != 0)
-		return (false);
+	const uint8_t *e, *m, *a;
+	size_t len;
 
+	len = prefix_len_nibbles;
+	a = computed;
+	e = cprefix_bin;
+
+	if (!nomask)
+		goto masked;
+
+	/* No mask, easy case. */
+	if (__predict_true(len > 1) && memcmp(e, a, len / 2) != 0)
+		return (false);
 	/* the first floor(nibbles / 2) bytes are now known to match */
 
 	/* check the final nibble, if any. */
-	if ((nibbles & 1) != 0 &&
-	    (computed[nibbles / 2] & 0xf0) != chosen[nibbles / 2])
+	if ((len & 1) != 0 && (a[len / 2] & 0xf0) != e[len / 2])
+		return (false);
+
+	return (true);
+
+masked:
+	m = cmask_bin;
+
+	/*
+	 * This would be a loop if colliding 8 bytes was practical for this
+	 * toy.  Currently it is not.  Maybe it would make sense with a low
+	 * density prefix mask.
+	 */
+	if (len > 2 * sizeof(uint32_t)) {
+		uint32_t word;
+
+		/* Yes, yes, cast alignment abuse.  x86. */
+		word = *(const uint32_t *)a ^ *(const uint32_t *)e;
+		word &= *(const uint32_t *)m;
+		if (word != 0)
+			return (false);
+
+		a += sizeof(word);
+		e += sizeof(word);
+		m += sizeof(word);
+		len -= (2 * sizeof(word));
+	}
+
+	while (len >= 2) {
+		uint8_t byte;
+
+		byte = (*a ^ *e) & *m;
+		if (byte != 0)
+			return (false);
+
+		a++;
+		e++;
+		m++;
+		len -= 2;
+	}
+
+	/* check the final nibble, if any. */
+	if (len != 0 && (((a[0] & 0xf0) ^ e[0]) & m[0]) != 0)
 		return (false);
 
 	return (true);
@@ -487,7 +550,7 @@ bruteForce(void *ptn)
 		/* compute sha1 over blob */
 		SHA1((void *)blob, bloblen, sha1buf);
 
-		if (!prefix_match(cprefix_bin, sha1buf, prefix_len_nibbles))
+		if (!prefix_match(sha1buf))
 			continue;
 
 		/* if match, signal winner and post global solution */
@@ -618,7 +681,7 @@ main(int argc, char **argv)
 	argv += optind;
 	if (argc == 0)
 		errx(EX_USAGE, "Missing PREFIX target");
-	if (argc > 1)
+	if (argc > 2)
 		errx(EX_USAGE, "Unexpected parameters provided");
 
 	x = strlen(argv[0]);
@@ -632,6 +695,23 @@ main(int argc, char **argv)
 	if (error != 0)
 		errx(EX_USAGE, "invalid hexademical prefix '%s'", argv[0]);
 	prefix_len_nibbles = x;
+
+	if (argc > 1) {
+		strlcpy(chosen_mask, argv[1], sizeof(chosen_mask));
+		error = validate_and_sanitize_hex_in_place(chosen_mask, cmask_bin);
+		if (error != 0)
+			errx(EX_USAGE, "invalid hexademical mask '%s'", argv[1]);
+		for (x = 0; x < nitems(cmask_bin) && x < prefix_len_nibbles / 2 /*lazy*/; x++) {
+			if ((uint8_t)cmask_bin[x] != 0xff) {
+				nomask = false;
+				break;
+			}
+		}
+	} else {
+		memset(chosen_mask, 'f', sizeof(chosen_mask));
+		chosen_mask[sizeof(chosen_mask) - 1] = '\0';
+		memset(cmask_bin, 0xff, sizeof(cmask_bin));
+	}
 
 	threads = NULL;
 	error = mtx_init(&win_coord_lock, mtx_plain);
