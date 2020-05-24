@@ -25,9 +25,8 @@ to the current `HEAD`.  Take care to only use `git reset --hard` with a clean
 tree.)
 
 For an example of how to mechanically switch to the chosen-prefix commit
-without destroying the working tree or index, see `post-commit.sample.sh`.
-This requires some mucking about in git internals, but isn't that what this toy
-is for?
+without destroying the working tree or index, see
+[`post-commit.sample.sh`](//github.com/cemeyer/gitbrutec/blob/master/post-commit.sample.sh).
 
 Shorter prefixes match more quickly.  Each additional hexadeximal digit can be
 expected to expand the search space by a factor of 16x.
