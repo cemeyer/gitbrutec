@@ -443,21 +443,28 @@ prefix_match(const uint8_t * __restrict computed)
 	a = computed;
 	e = cprefix_bin;
 
-	if (!nomask)
-		goto masked;
+	if (nomask) {
+		/* Do word test first. */
+		if (len >= 8) {
+			if (*(const uint32_t *)e != *(const uint32_t *)a)
+				return (false);
+			a += 4;
+			e += 4;
+			len -= 8;
+		}
 
-	/* No mask, easy case. */
-	if (__predict_true(len > 1) && memcmp(e, a, len / 2) != 0)
-		return (false);
-	/* the first floor(nibbles / 2) bytes are now known to match */
+		if (len > 1 && memcmp(e, a, len / 2) != 0)
+			return (false);
+		/* the first floor(nibbles / 2) bytes are now known to match */
 
-	/* check the final nibble, if any. */
-	if ((len & 1) != 0 && (a[len / 2] & 0xf0) != e[len / 2])
-		return (false);
+		/* check the final nibble, if any. */
+		if ((len & 1) != 0 && (a[len / 2] & 0xf0) != e[len / 2])
+			return (false);
 
-	return (true);
+		return (true);
+	}
 
-masked:
+	/* Masked case. */
 	m = cmask_bin;
 
 	/*
