@@ -745,46 +745,64 @@ bruteForceNonce(void *ptn)
 	(void)tidx;
 
 	extra = strlen(noncefield) + 1 /*space*/ + noncelen + 1 /*nl*/;
-	blob = allocWorkingBlob(&commitlen, &bloblen, extra);
 
 	eoh = strstr(the_object, "\n\n");
 	if (eoh == NULL)
 		errx(1, "malformed commit: no end of headers");
-	obj_header_len = (eoh - the_object) + 1;
+	eoh++;
+	obj_header_len = (eoh - the_object);
+	/* Is there an existing nonce we should rewrite? */
+	if (obj_header_len > extra &&
+	    strncmp(eoh - extra, noncefield, strlen(noncefield)) == 0 &&
+	    *(eoh - extra + strlen(noncefield)) == ' ')
+		extra = 0;
+
+	blob = allocWorkingBlob(&commitlen, &bloblen, extra);
 
 	wp = blob + commitlen + 1;
 	memcpy(wp, the_object, obj_header_len);
 	wp += obj_header_len;
 
-	arc4random_buf(&startval, sizeof(startval));
-
-	/* noncefield nonce\n */
-	memcpy(wp, noncefield, strlen(noncefield));
-	wp += strlen(noncefield);
-	*wp = ' ';
-	wp++;
-	noncep = wp;
-	for (size_t i = 0; i < noncelen; i++) {
-		unsigned digit;
-
-		digit = (startval % 26);
-		startval /= 26;
-
-		*wp = ('A' + digit);
+	/* Existing nonce we should rewrite. */
+	if (extra == 0) {
+		noncep = (wp - 1 - noncelen);
+	} else {
+		/* noncefield nonce\n */
+		memcpy(wp, noncefield, strlen(noncefield));
+		wp += strlen(noncefield);
+		*wp = ' ';
 		wp++;
+		noncep = wp;
+		*(noncep + noncelen) = '\n';
 	}
-	*wp = '\n';
-	wp++;
-	memcpy(wp, the_object + obj_header_len, the_obj_size - obj_header_len);
+
+	memcpy(noncep + noncelen + 1, the_object + obj_header_len,
+	    the_obj_size - obj_header_len);
 	blob[bloblen] = '\0';
 
 	/* Initial blob assembled!  Brute force it. */
-	k = 0;
-	while (true) {
+	for (k = 0;; k++) {
 		/* Poll for suicide signal occasionally. */
-		if ((++k % 4) == 0 &&
+		if ((k % 64) == 0 &&
 		    atomic_load_explicit(&win_taken, memory_order_acquire))
 			thrd_exit(0);
+
+		/*
+		 * Occasionally pick a new random number in case we were
+		 * adjacent to another thread's region.  Probably arc4random is
+		 * really cheap compared to a SHA1, but we restrict it anyway.
+		 */
+		if ((k % 256) == 0) {
+			arc4random_buf(&startval, sizeof(startval));
+			for (wp = noncep; wp < noncep + noncelen; wp++) {
+				unsigned digit;
+
+				digit = (startval % 26);
+				startval /= 26;
+
+				*wp = ('A' + digit);
+			}
+		}
 
 		/* compute sha1 over blob */
 		SHA1((void *)blob, bloblen, sha1buf);
@@ -792,12 +810,24 @@ bruteForceNonce(void *ptn)
 			break;
 
 		/* Increment little-endian base26 nonce in-place. */
-		for (wp = noncep;; wp++) {
+		for (wp = noncep; wp < noncep + noncelen; wp++) {
 			/* Check for carry. */
 			if (++(*wp) != ('Z' + 1))
 				break;
 			*wp = 'A';
 		}
+		/*
+		 * Running off the end is impossible.  Overflow is >>> 256 from
+		 * UINT64_MAX in base 26.  The high digit of that value in base
+		 * 26 is 'H' so we would have to count (('Z' - 'H') * (26^13))
+		 * times past the maximal random start value to overflow.
+		 *
+		 * 256 <<< (('Z' - 'H') * (26^13)).
+		 */
+#if 0
+		if (__predict_false(wp == noncep + noncelen))
+			__assert_unreachable();
+#endif
 	}
 
 	struct winparam winp = {
