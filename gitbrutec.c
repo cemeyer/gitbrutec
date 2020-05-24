@@ -3,7 +3,7 @@
  * I believe that means I can use a different license for my work (not a
  * lawyer).
  *
- * Copyright 2019 Conrad Meyer <cem@FreeBSD.org>
+ * Copyright 2020 Conrad Meyer <cem@FreeBSD.org>
  *
  * SPDX-License-Identifier: WTFNMFPL-1.0
  * License text follows:
@@ -61,6 +61,9 @@
 #ifndef __read_mostly
 #define	__read_mostly		__section(".data.read_mostly")
 #endif
+#ifndef	__assert_unreachable
+#define	__assert_unreachable()	__builtin_trap()
+#endif
 
 static const char *progname;
 
@@ -69,12 +72,17 @@ static const char *progname;
 
 static bool forceflag __read_mostly;
 static bool verboseflag __read_mostly;
+static bool dateflag __read_mostly;
+#define	DEFAULT_NONCE_FIELD "x-gitbrutec-nonce"
+static const char *noncefield __read_mostly;
+
 static bool nomask __read_frequently = true;
 static char chosen_prefix[MAX_HEX_PRELEN],
 	    chosen_mask[MAX_HEX_PRELEN],
 	    cprefix_bin[MAX_PREFIX_LEN] __read_frequently,
 	    cmask_bin[MAX_PREFIX_LEN] __read_frequently;
 static size_t prefix_len_nibbles __read_mostly;
+
 static unsigned nthreads __read_mostly;
 
 static const char *the_object __read_mostly;
@@ -99,9 +107,14 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-"usage: %s [-fv] [-t THREADS] PREFIX [MASK]\n"
+"usage: %s [-dfv] [-t THREADS] [OPTIONS] PREFIX [MASK]\n"
 "\n"
+"        -d : Date mode.  Walk author/commit date backwards to find the\n"
+"             target PREFIX.  Otherwise, the default is to insert a\n"
+"             nonce field in the commit metadata.\n"
 "        -f : Force.  Re-run, even if current hash matches prefix.\n"
+"        -N NONCEFIELD : Use a specific fieldname for the nonce.  The\n"
+"             default is \"" DEFAULT_NONCE_FIELD "\".  Incompatible with '-d.'\n"
 "        -t THREADS : Specify the number of threads to use.  The tool\n"
 "             defaults to 'kern.smp.cores', if available, falling back to\n"
 "             'hw.ncpu' or sysconf() or 1 if none are available.\n"
@@ -342,8 +355,7 @@ explore(void *dummy __unused)
 		for (i = 0; i <= max_commit_behind; i++)
 			explore_emit((struct try){ i, max });
 	}
-	/* UNREACHABLE */
-	abort();
+	__assert_unreachable();
 }
 
 static void
@@ -488,34 +500,156 @@ masked:
 	return (true);
 }
 
+/*
+ * Allocates space for the 'commit %zu\0<blob contents><extra>\0', populates
+ * the 'commit %zu\0' part, and leaves the caller to fill in '<blob contents>
+ * <extra>'.  Commitlen is strlen('commit %zu'); bloblen is the total size,
+ * minus one.
+ */
+static char *
+allocWorkingBlob(size_t *commitlen_out, size_t *bloblen_out, size_t extra)
+{
+	char *blob;
+	size_t bloblen;
+	int commitlen, rc;
+
+	commitlen = snprintf(NULL, 0, "commit %zu", the_obj_size + extra);
+	assert(commitlen > 0);
+
+	bloblen = commitlen + 1 /* NUL */ + the_obj_size + extra;
+
+	blob = malloc(bloblen + 1);
+	rc = snprintf(blob, bloblen + 1, "commit %zu", the_obj_size + extra);
+	assert(rc == commitlen);
+
+	blob[commitlen] = '\0';
+
+	if (commitlen_out != NULL)
+		*commitlen_out = commitlen;
+	if (bloblen_out != NULL)
+		*bloblen_out = bloblen;
+	return (blob);
+}
+
+struct winparam {
+	const char *blob;
+	size_t obj_offset;
+	size_t obj_size;
+
+	/* date-search specific. */
+	uintmax_t orig_adate, orig_cdate;
+	uintmax_t adate, cdate;
+
+	/* nonce-search specific. */
+	const char *noncep;
+	size_t noncelen;
+};
+
+static void
+win(const unsigned char *sha1buf, const struct winparam *parm)
+{
+	char *output, tmpfile[PATH_MAX], cmd[PATH_MAX];
+	FILE *tmpf;
+	size_t wr;
+	int rc, tmpfd;
+
+	/* if match, signal winner and post global solution */
+	rc = mtx_lock(&win_coord_lock);
+	assert(rc == thrd_success);
+
+	/* R-M-W serialized by win_coord_lock */
+	if (atomic_load_explicit(&win_taken, memory_order_acquire)) {
+		/* We found a winner but lost the race! */
+		rc = mtx_unlock(&win_coord_lock);
+		assert(rc == thrd_success);
+		thrd_exit(0);
+	}
+
+	atomic_store_explicit(&win_taken, true, memory_order_release);
+	rc = cnd_broadcast(&win_condvar);
+	assert(rc == thrd_success);
+
+	rc = mtx_unlock(&win_coord_lock);
+	assert(rc == thrd_success);
+
+	if (verboseflag) {
+		printf("chosen: %02hhx%02hhx%02hhx%02hhx", cprefix_bin[0],
+		    cprefix_bin[1], cprefix_bin[2], cprefix_bin[3]);
+		if (dateflag)
+			printf(" orig_adate:%ju orig_cdate:%ju\n",
+			    parm->orig_adate, parm->orig_cdate);
+		else
+			printf("\n");
+
+		printf("actual: %02hhx%02hhx%02hhx%02hhx", sha1buf[0],
+		    sha1buf[1], sha1buf[2], sha1buf[3]);
+		if (dateflag)
+			printf(" foundadate:%ju foundcdate:%ju\n", parm->adate,
+			    parm->cdate);
+		else
+			printf(" nonce: %.*s\n", (int)parm->noncelen,
+			    parm->noncep);
+
+		printf("significant nibbles: %zu\n", prefix_len_nibbles);
+	}
+
+	/*
+	 * Blast out our commit object contents to disk because popen
+	 * is trash and doesn't have a way to signal EOF.
+	 */
+	snprintf(tmpfile, sizeof(tmpfile), "/tmp/%s.p%ld.u%ju.XXXXXX",
+	    progname, (long)getpid(), (uintmax_t)getuid());
+
+	tmpfd = mkstemp(tmpfile);
+	if (tmpfd < 0)
+		err(EX_OSERR, "mkstemp");
+
+	tmpf = fdopen(tmpfd, "w");
+	assert(tmpf);
+	wr = fwrite(parm->blob + parm->obj_offset, 1, parm->obj_size, tmpf);
+	assert(wr == parm->obj_size);
+	fflush(tmpf);
+	fsync(fileno(tmpf));
+	fclose(tmpf);
+
+	/* Finally, create the damn git commit object */
+	rc = snprintf(cmd, sizeof(cmd),
+	    "git hash-object -t commit -w --no-filters -- %s",
+	    tmpfile);
+	assert(rc >= 0 && (size_t)rc < sizeof(cmd));
+
+	command(&output, cmd);
+	unlink(tmpfile);
+
+	/* Trim trailing whitespace */
+	for (char *x = output + strlen(output);
+	    x > output && isspace(x[-1]); x--)
+		x[-1] = '\0';
+
+	printf("Created commit %s\n", output);
+	fflush(stdout);
+	thrd_exit(0);
+}
+
 static int
 bruteForce(void *ptn)
 {
-	static size_t k;
-
 	unsigned char sha1buf[SHA_DIGEST_LENGTH];
 	char savedchr;
 
 	struct try *t;
 	char *blob;
-	int commitlen, rc;
+	size_t bloblen, commitlen;
 	unsigned tidx;
-	size_t bloblen;
+	int rc;
 
 	time_t author_date, committer_date, adp, cdp;
 	size_t ad_idx, cd_idx, ad_len, cd_len;
+	size_t k;
 
 	tidx = (uintptr_t)ptn;
 
-	commitlen = snprintf(NULL, 0, "commit %zu", the_obj_size);
-
-	bloblen = commitlen + 1 /* NUL */ + the_obj_size;
-
-	blob = malloc(bloblen + 1);
-	rc = snprintf(blob, bloblen + 1, "commit %zu", the_obj_size);
-	assert(rc == commitlen);
-
-	blob[commitlen] = '\0';
+	blob = allocWorkingBlob(&commitlen, &bloblen, 0);
 	memcpy(blob + commitlen + 1, the_object, the_obj_size);
 	blob[bloblen] = '\0';
 
@@ -524,6 +658,7 @@ bruteForce(void *ptn)
 	ad_idx += commitlen + 1;
 	cd_idx += commitlen + 1;
 
+	k = 0;
 	while (true) {
 		/* Poll for suicide signal occasionally. */
 		if ((++k % 4) == 0 &&
@@ -573,83 +708,108 @@ bruteForce(void *ptn)
 
 		/* compute sha1 over blob */
 		SHA1((void *)blob, bloblen, sha1buf);
-
-		if (!prefix_match(sha1buf))
-			continue;
-
-		/* if match, signal winner and post global solution */
-		rc = mtx_lock(&win_coord_lock);
-		assert(rc == thrd_success);
-
-		/* R-M-W serialized by win_coord_lock */
-		if (atomic_load_explicit(&win_taken, memory_order_acquire)) {
-			/* We found a winner but lost the race! */
-			rc = mtx_unlock(&win_coord_lock);
-			assert(rc == thrd_success);
-			thrd_exit(0);
-		}
-
-		atomic_store_explicit(&win_taken, true, memory_order_release);
-		rc = cnd_broadcast(&win_condvar);
-		assert(rc == thrd_success);
-
-		rc = mtx_unlock(&win_coord_lock);
-		assert(rc == thrd_success);
-
-		if (verboseflag) {
-			printf(
-			    "%02hhx%02hhx%02hhx%02hhx a:%ju c:%ju\n"
-			    "%02hhx%02hhx%02hhx%02hhx a:%ju c:%ju\n"
-			    "(chosen, actual, nibbles:%zu\n",
-			    cprefix_bin[0], cprefix_bin[1], cprefix_bin[2],
-			    cprefix_bin[3], adp, cdp, sha1buf[0], sha1buf[1],
-			    sha1buf[2], sha1buf[3], (uintmax_t)author_date,
-			    (uintmax_t)committer_date, prefix_len_nibbles);
-		}
-
-		/*
-		 * Blast out our commit object contents to disk because popen
-		 * is trash and doesn't have a way to signal EOF.
-		 */
-		char *output, tmpfile[PATH_MAX], cmd[PATH_MAX];
-		FILE *tmpf;
-		size_t wr;
-		int tmpfd;
-
-		snprintf(tmpfile, sizeof(tmpfile), "/tmp/%s.p%ld.u%ju.XXXXXX",
-		    progname, (long)getpid(), (uintmax_t)getuid());
-
-		tmpfd = mkstemp(tmpfile);
-		if (tmpfd < 0)
-			err(EX_OSERR, "mkstemp");
-
-		tmpf = fdopen(tmpfd, "w");
-		assert(tmpf);
-		wr = fwrite(blob + commitlen + 1, 1, the_obj_size, tmpf);
-		assert(wr == the_obj_size);
-		fflush(tmpf);
-		fsync(fileno(tmpf));
-		fclose(tmpf);
-
-		/* Finally, create the damn git commit object */
-		rc = snprintf(cmd, sizeof(cmd),
-		    "git hash-object -t commit -w --no-filters -- %s",
-		    tmpfile);
-		assert(rc >= 0 && (size_t)rc < sizeof(cmd));
-
-		command(&output, cmd);
-		unlink(tmpfile);
-
-		/* Trim trailing whitespace */
-		for (char *x = output + strlen(output);
-		    x > output && isspace(x[-1]);
-		    x--)
-			x[-1] = '\0';
-
-		printf("Created commit %s\n", output);
-		fflush(stdout);
-		thrd_exit(0);
+		if (prefix_match(sha1buf))
+			break;
 	}
+
+	struct winparam wp = {
+		.blob = blob,
+		.obj_offset = commitlen + 1,
+		.obj_size = the_obj_size,
+
+		.orig_adate = author_date,
+		.orig_cdate = committer_date,
+		.adate = adp,
+		.cdate = cdp,
+	};
+	win(sha1buf, &wp);
+	__assert_unreachable();
+}
+
+static int
+bruteForceNonce(void *ptn)
+{
+	/* strlen(UINT64_MAX in base 26) is 14 characters. */
+	static const size_t noncelen = 14;
+
+	unsigned char sha1buf[SHA_DIGEST_LENGTH];
+
+	char *blob, *eoh, *wp, *noncep;
+	size_t commitlen, bloblen, extra, obj_header_len;
+	uint64_t startval;
+
+	size_t k;
+	unsigned tidx;
+
+	tidx = (uintptr_t)ptn;
+	(void)tidx;
+
+	extra = strlen(noncefield) + 1 /*space*/ + noncelen + 1 /*nl*/;
+	blob = allocWorkingBlob(&commitlen, &bloblen, extra);
+
+	eoh = strstr(the_object, "\n\n");
+	if (eoh == NULL)
+		errx(1, "malformed commit: no end of headers");
+	obj_header_len = (eoh - the_object) + 1;
+
+	wp = blob + commitlen + 1;
+	memcpy(wp, the_object, obj_header_len);
+	wp += obj_header_len;
+
+	arc4random_buf(&startval, sizeof(startval));
+
+	/* noncefield nonce\n */
+	memcpy(wp, noncefield, strlen(noncefield));
+	wp += strlen(noncefield);
+	*wp = ' ';
+	wp++;
+	noncep = wp;
+	for (size_t i = 0; i < noncelen; i++) {
+		unsigned digit;
+
+		digit = (startval % 26);
+		startval /= 26;
+
+		*wp = ('A' + digit);
+		wp++;
+	}
+	*wp = '\n';
+	wp++;
+	memcpy(wp, the_object + obj_header_len, the_obj_size - obj_header_len);
+	blob[bloblen] = '\0';
+
+	/* Initial blob assembled!  Brute force it. */
+	k = 0;
+	while (true) {
+		/* Poll for suicide signal occasionally. */
+		if ((++k % 4) == 0 &&
+		    atomic_load_explicit(&win_taken, memory_order_acquire))
+			thrd_exit(0);
+
+		/* compute sha1 over blob */
+		SHA1((void *)blob, bloblen, sha1buf);
+		if (prefix_match(sha1buf))
+			break;
+
+		/* Increment little-endian base26 nonce in-place. */
+		for (wp = noncep;; wp++) {
+			/* Check for carry. */
+			if (++(*wp) != ('Z' + 1))
+				break;
+			*wp = 'A';
+		}
+	}
+
+	struct winparam winp = {
+		.blob = blob,
+		.obj_offset = commitlen + 1,
+		.obj_size = the_obj_size + extra,
+
+		.noncep = noncep,
+		.noncelen = noncelen,
+	};
+	win(sha1buf, &winp);
+	__assert_unreachable();
 }
 
 int
@@ -659,6 +819,7 @@ main(int argc, char **argv)
 	char *hash, *obj;
 	size_t x;
 	int c, error;
+	int (*worker)(void *);
 
 	if (argc < 1)
 		abort();
@@ -678,13 +839,23 @@ main(int argc, char **argv)
 		error = 2;
 	nthreads = error;
 
-	while ((c = getopt(argc, argv, "fht:v")) != -1) {
+	while ((c = getopt(argc, argv, "dfhN:t:v")) != -1) {
 		switch (c) {
+		case 'd':
+			if (noncefield != NULL)
+				errx(EX_USAGE, "-d incompatible with -N option");
+			dateflag = true;
+			break;
 		case 'f':
 			forceflag = true;
 			break;
 		case 'h':
 			usage();
+			break;
+		case 'N':
+			if (dateflag)
+				errx(EX_USAGE, "-N incompatible with -d option");
+			noncefield = strdup(optarg);
 			break;
 		case 't':
 			x = atoi(optarg);
@@ -737,6 +908,11 @@ main(int argc, char **argv)
 		memset(cmask_bin, 0xff, sizeof(cmask_bin));
 	}
 
+	if (!dateflag && noncefield == NULL)
+		noncefield = DEFAULT_NONCE_FIELD;
+
+	/* Done argument parsing. */
+
 	threads = NULL;
 	error = mtx_init(&win_coord_lock, mtx_plain);
 	assert(error == thrd_success);
@@ -745,9 +921,9 @@ main(int argc, char **argv)
 
 	start = time(NULL);
 	hash = curhash();
+	/* XXX does not account for mask. */
 	if (strncmp(hash, chosen_prefix, prefix_len_nibbles) == 0 && !forceflag) {
-		if (verboseflag)
-			printf("%s: found existing match, skipping\n", __func__);
+		printf("%s: found existing match, skipping\n", __func__);
 		exit(0);
 	}
 
@@ -755,24 +931,31 @@ main(int argc, char **argv)
 	the_obj_size = strlen(obj);
 	the_object = obj;
 
-	obj = catfile_p_hash("HEAD^");
-	setMaxCommitBehind(obj);
-
 	threads = calloc(nthreads, sizeof(*threads));
 	assert(threads != NULL);
 
-	ck_ring_init(&possibilities, nitems(poss_buf));
-	poss_return_buf = calloc(nthreads - 1, sizeof(*poss_return_buf));
-	for (x = 0; x < nthreads - 1; x++)
-		ck_ring_init(&poss_return_buf->q,
-		    nitems(poss_return_buf->ringbuf));
+	if (dateflag) {
+		obj = catfile_p_hash("HEAD^");
+		setMaxCommitBehind(obj);
 
-	error = thrd_create(&threads[0], explore, NULL);
-	assert(error == thrd_success);
+		ck_ring_init(&possibilities, nitems(poss_buf));
+		poss_return_buf = calloc(nthreads - 1, sizeof(*poss_return_buf));
 
-	for (x = 1; x < nthreads; x++) {
-		error = thrd_create(&threads[x], bruteForce,
-		    (void*)((uintptr_t)x - 1));
+		nthreads--;
+
+		for (x = 0; x < nthreads; x++)
+			ck_ring_init(&poss_return_buf->q,
+			    nitems(poss_return_buf->ringbuf));
+
+		error = thrd_create(&threads[0], explore, NULL);
+		assert(error == thrd_success);
+
+		worker = bruteForce;
+	} else
+		worker = bruteForceNonce;
+
+	for (x = 0; x < nthreads; x++) {
+		error = thrd_create(&threads[x], worker, (void*)((uintptr_t)x));
 		assert(error == thrd_success);
 	}
 
